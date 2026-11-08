@@ -1,0 +1,11 @@
+# NEVER commit applicant data or credentials
+*.xlsx
+*.xls
+*.csv
+!data/*.csv
+!form_baru/FORM_SPEC.csv
+training_data/
+service_account*.json
+outputs/
+__pycache__/
+.venv/

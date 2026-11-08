@@ -1,0 +1,153 @@
+"""Training + evaluasi.  Pakai:  python train.py --data "Form Loker Tele Marketing (Jawaban) (1).xlsx" """
+import argparse, json, re, sys, warnings
+from pathlib import Path
+import joblib, numpy as np, pandas as pd
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score, brier_score_loss
+from sklearn.model_selection import StratifiedKFold
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from config import *
+from features import FEATURES, build_features, dedupe_applicants
+from modeling import Explainer, compute_rates, make_pipeline, prepare_X
+from geo import GeoResolver
+from labeling import relabel
+
+warnings.filterwarnings("ignore")
+
+
+def lib_versions():
+    import importlib.metadata as md
+    return {k: md.version(k) for k in ("scikit-learn", "xgboost", "shap", "pandas", "numpy", "rapidfuzz", "joblib")}
+
+
+def in_windows(ts, windows):
+    m = pd.Series(False, index=ts.index)
+    for a, b in windows:
+        m |= (ts >= pd.Timestamp(a)) & (ts <= pd.Timestamp(b) + pd.Timedelta(days=1))
+    return m
+
+
+def best_threshold(y, p):
+    # Youden's J (TPR - FPR): lebih stabil daripada F1 saat prevalensi ~40-50% dan kurva F1 datar
+    ts = np.linspace(0.05, 0.95, 91)
+    y = np.asarray(y)
+    j = [((p >= t) & (y == 1)).sum() / max((y == 1).sum(), 1) - ((p >= t) & (y == 0)).sum() / max((y == 0).sum(), 1) for t in ts]
+    return float(ts[int(np.argmax(j))])
+
+
+def metrics(y, p, thr):
+    return dict(auc=roc_auc_score(y, p), ap=average_precision_score(y, p), f1=f1_score(y, p >= thr),
+                precision=precision_score(y, p >= thr, zero_division=0), recall=recall_score(y, p >= thr), brier=brier_score_loss(y, p))
+
+
+def cv_oof(name, X, y, repeats=5):
+    oof = np.zeros((repeats, len(y)))
+    for r in range(repeats):
+        for tr, te in StratifiedKFold(5, shuffle=True, random_state=SEED + r).split(X, y):
+            m = make_pipeline(name, SEED).fit(X.iloc[tr], y.iloc[tr])
+            oof[r, te] = m.predict_proba(X.iloc[te])[:, 1]
+    return oof
+
+
+def label_from_master(raw: pd.DataFrame, master_path) -> pd.DataFrame:
+    """Label dari Excel induk (build_master.py -> diisi/dikonfirmasi perusahaan): cocokkan baris form lama lewat NIK/No HP + nama dan waktu pengisian."""
+    from harmonize import person_key
+    m = pd.read_excel(master_path, sheet_name="Data_Pelamar")
+    m = m[m["Sumber Form"].astype(str).str.startswith("Form Lama") & m["Status Lanjut Interview"].notna()].copy()
+    m["_k"] = [person_key(k, n, h) + "|" + pd.Timestamp(t).strftime("%Y%m%d%H%M") for k, n, h, t in
+               zip(m["NIK/KTP"], m["Nama"], m["No HP"], m["Waktu Pengisian"])]
+    lab = dict(zip(m["_k"], m["Status Lanjut Interview"].eq("Lanjut Interview")))
+    cols = {re.sub(r"\s+", " ", str(c)).strip().lower(): c for c in raw.columns}
+    g = lambda p: raw[next(v for k, v in cols.items() if k.startswith(p))]
+    ts = pd.to_datetime(g("timestamp"), errors="coerce")
+    keys = [person_key(k, n, h) + "|" + (t.strftime("%Y%m%d%H%M") if pd.notna(t) else "") for k, n, h, t in zip(g("nomor ktp"), g("nama lengkap"), g("nomor hp"), ts)]
+    raw = raw.copy()
+    raw["Lanjut Interview"] = [lab.get(k, np.nan) for k in keys]
+    n0 = len(raw)
+    raw = raw[raw["Lanjut Interview"].notna()].copy()
+    raw["Lanjut Interview"] = raw["Lanjut Interview"].astype(bool)
+    print(f"Label dari Excel induk: {len(raw)} dari {n0} baris form lama berlabel")
+    return raw
+
+
+def main(a):
+    raw = pd.read_excel(a.data)
+    if a.master:
+        raw = label_from_master(raw, a.master)
+        a.all_dates = True  # label sudah dikonfirmasi perusahaan untuk semua periode
+    if not a.master and not a.rekap and "Lanjut Interview" not in raw.columns:  # FORM BARU: label dari kolom "Status Seleksi Berkas" yang diisi recruiter
+        col = next((c for c in raw.columns if str(c).strip().lower().startswith("status seleksi berkas")), None)
+        if col is None:
+            raise SystemExit("Tidak ada label: beri --rekap Rekap_All.xlsx, atau pakai form baru dengan kolom 'Status Seleksi Berkas'.")
+        raw = raw[raw[col].astype(str).str.strip().ne("") & raw[col].notna()].copy()  # hanya yang sudah direview recruiter
+        raw["Lanjut Interview"] = raw[col].astype(str).str.strip().str.lower().str.startswith("lolos")
+    if a.rekap and not a.master:  # label ulang dari Rekap_All (No HP + nama), menggantikan kolom "Lanjut Interview" hasil XLOOKUP nama
+        raw["Lanjut Interview"] = relabel(raw, a.rekap).astype(bool)
+    geo = GeoResolver()
+    feat = dedupe_applicants(build_features(raw, geo, DEFAULT_PLACEMENT))
+    rel = (feat if a.all_dates else feat[in_windows(feat["_ts"], RELIABLE_WINDOWS)]).reset_index(drop=True)
+    X, y = prepare_X(rel), rel["_y"].astype(int)
+    print(f"Pelamar unik total={len(feat)} | dipakai (label andal)={len(rel)} | positif={y.sum()} ({y.mean():.1%})")
+
+    results, oofs = {}, {}
+    for name in ("logreg", "rf", "xgb"):
+        oof = cv_oof(name, X, y)
+        p = oof.mean(0)
+        thr = best_threshold(y, p)
+        per_rep = [roc_auc_score(y, o) for o in oof]
+        results[name] = dict(**metrics(y, p, thr), threshold=thr, auc_sd=float(np.std(per_rep)))
+        oofs[name] = p
+        print(f"{name:7s} AUC={results[name]['auc']:.3f}±{results[name]['auc_sd']:.3f} AP={results[name]['ap']:.3f} "
+              f"F1={results[name]['f1']:.3f} P={results[name]['precision']:.2f} R={results[name]['recall']:.2f} thr={thr:.2f}")
+    # baseline: hanya jarak
+    from sklearn.linear_model import LogisticRegression
+    d = rel[["jarak_km"]].clip(upper=100).fillna(rel["jarak_km"].median())
+    pj = np.zeros(len(y))
+    for tr, te in StratifiedKFold(5, shuffle=True, random_state=SEED).split(d, y):
+        pj[te] = LogisticRegression().fit(d.iloc[tr], y.iloc[tr]).predict_proba(d.iloc[te])[:, 1]
+    results["baseline_jarak_saja"] = dict(auc=roc_auc_score(y, pj), ap=average_precision_score(y, pj))
+    print(f"baseline jarak-saja AUC={results['baseline_jarak_saja']['auc']:.3f}  (prevalensi={y.mean():.3f})")
+
+    # uji lintas waktu: model dilatih di RELIABLE_WINDOWS, diuji di CHECK_WINDOW (periode yang tidak dipakai training)
+    chk = feat[in_windows(feat["_ts"], [CHECK_WINDOW])].reset_index(drop=True)
+    temporal = {}
+    if len(chk) >= 20 and chk["_y"].nunique() > 1:
+        Xc, yc = prepare_X(chk), chk["_y"].astype(int)
+        for name in ("logreg", "rf", "xgb"):
+            p = make_pipeline(name, SEED).fit(X, y).predict_proba(Xc)[:, 1]
+            temporal[name] = dict(n_test=len(chk), pos_rate=float(yc.mean()), auc=roc_auc_score(yc, p), ap=average_precision_score(yc, p))
+            print(f"[periode pembanding {CHECK_WINDOW[0][:7]}..{CHECK_WINDOW[1][:7]}] {name:7s} n={len(chk)} AUC={temporal[name]['auc']:.3f}")
+    # pilih model terbaik berdasarkan AP CV (lalu AUC)
+    score = {k: results[k]["ap"] + results[k]["auc"] for k in ("logreg", "rf", "xgb")}
+    best = max(score, key=score.get)
+    if best != "logreg" and score[best] - score["logreg"] < 0.03:
+        best = "logreg"  # selisih kecil = masih dalam noise CV -> pilih model yang paling mudah dijelaskan & ringan di-deploy
+    if a.model:
+        best = a.model
+    thr = results[best]["threshold"]
+    print("Model dipilih:", best, "threshold:", round(thr, 2))
+
+    final = make_pipeline(best, SEED).fit(X, y)
+    expl = Explainer(final, background_X=X)
+    joblib.dump(dict(pipeline=final, explainer_state=expl.to_state(), versions=lib_versions(), threshold=thr, rates=compute_rates(rel, y), model_name=best, features=FEATURES,
+                     train_info=dict(n=len(rel), pos=int(y.sum()), windows=RELIABLE_WINDOWS, placement=DEFAULT_PLACEMENT)), MODEL_PATH)
+
+    # importance global (rata-rata |SHAP| per tema)
+    contrib = expl.contributions(X)
+    imp = contrib.abs().mean().sort_values(ascending=False).rename("mean_abs_shap")
+    imp.to_csv(ROOT / "outputs" / "feature_importance.csv")
+    print("\nPengaruh per tema (mean |SHAP|):\n", imp.round(3).to_string())
+    out = dict(n_train=len(rel), n_pos=int(y.sum()), cv=results, temporal=temporal, chosen=best, threshold=thr)
+    (ROOT / "outputs" / "metrics.json").write_text(json.dumps(out, indent=2, default=float))
+    oof = pd.DataFrame(dict(ts=rel["_ts"], y=y, **{k: v for k, v in oofs.items()}))
+    oof.to_csv(ROOT / "outputs" / "oof_predictions.csv", index=False)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--master", help="path Excel induk (Data_Induk_Pelamar_*.xlsx) berisi Status Lanjut Interview; menggantikan --rekap")
+    ap.add_argument("--rekap", help="path Rekap_All.xlsx untuk relabel lewat No HP")
+    ap.add_argument("--model", choices=["logreg", "rf", "xgb"])
+    ap.add_argument("--all-dates", action="store_true", help="pakai semua tanggal (untuk form baru yang labelnya lengkap); default: hanya RELIABLE_WINDOWS")
+    main(ap.parse_args())
